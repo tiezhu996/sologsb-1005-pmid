@@ -1,5 +1,8 @@
 export type Role = 'author' | 'examiner' | 'viewer'
 
+/** 特征与说明书段落支持关系的核对状态 */
+export type SupportStatusKind = 'full' | 'partial' | 'amendment' | 'review'
+
 export interface Claim {
   id: string
   number: number
@@ -25,6 +28,23 @@ export interface Feature {
   ownerRole: Role
 }
 
+/**
+ * 一条“技术特征 ↔ 说明书段落”的核对记录。
+ * paragraphSnapshot 保存标记当时的段落文字摘要；段落正文一旦改动，
+ * status 会被重置为 'review'（待复核）。
+ */
+export interface SupportStatusRecord {
+  id: string
+  featureId: string
+  paragraphId: string
+  status: SupportStatusKind
+  note: string
+  paragraphSnapshot: string
+  /** 因段落正文变更退回待复核前的结论，用于提醒展示 */
+  priorStatus?: SupportStatusKind
+  updatedAt: string
+}
+
 export interface Annotation {
   id: string
   featureId: string
@@ -47,6 +67,8 @@ export interface ClaimVersion {
   createdAt: string
   claims: Claim[]
   features: Feature[]
+  /** 保存版本时的支持核对状态组（含依据摘要） */
+  supportStatuses: SupportStatusRecord[]
 }
 
 export interface Position {
@@ -62,6 +84,7 @@ export interface WorkbenchState {
   features: Feature[]
   annotations: Annotation[]
   orphanMappings: OrphanMapping[]
+  supportStatuses: SupportStatusRecord[]
   versions: ClaimVersion[]
   role: Role
   selectedClaimId: string
@@ -73,8 +96,9 @@ export interface WorkbenchState {
 export interface ValidationIssue {
   id: string
   severity: 'error' | 'warning'
-  type: 'cycle' | 'missing-support' | 'orphan-mapping' | 'empty-feature'
+  type: 'cycle' | 'missing-support' | 'orphan-mapping' | 'empty-feature' | 'stale-support'
   featureId?: string
+  paragraphId?: string
   title: string
   detail: string
 }

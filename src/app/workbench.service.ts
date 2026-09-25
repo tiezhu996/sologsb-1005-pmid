@@ -1,9 +1,10 @@
 import { Injectable, OnDestroy } from '@angular/core'
 import { BehaviorSubject, map, type Observable } from 'rxjs'
-import type { Annotation, Claim, ClaimVersion, Feature, Paragraph, Position, Role, ValidationIssue, WorkbenchState } from './models'
+import type { Annotation, Claim, ClaimVersion, Feature, Paragraph, Position, Role, SupportStatusKind, SupportStatusRecord, ValidationIssue, WorkbenchState } from './models'
 
 const STORAGE_KEY = 'patent-claim-mapping-workbench-v1'
 const POSITION_KEY = 'patent-claim-mapping-position-v1'
+const SNAPSHOT_PREVIEW = 60
 
 const initialClaims: Claim[] = [
   { id: 'claim-1', number: 1, title: '一种自适应展柜环境控制装置', independent: true, text: '一种自适应展柜环境控制装置，包括：柜体；环境传感模块，设置于所述柜体内并用于采集温湿度数据；以及控制模块，与所述环境传感模块通信，并根据所述温湿度数据调节所述柜体的微环境。' },
@@ -25,6 +26,27 @@ const initialFeatures: Feature[] = [
   { id: 'feature-e', claimId: 'claim-2', label: 'E · 对角线布置', text: '多个温湿度传感器沿柜体对角线布置', parentId: null, referenceIds: [], supportIds: ['para-0018'], ownerRole: 'author' },
   { id: 'feature-f', claimId: 'claim-3', label: 'F · 分级调节', text: '基于历史数据与当前数据的偏差分级调节除湿单元', parentId: null, referenceIds: [], supportIds: ['para-0024'], ownerRole: 'author' }
 ]
+function seedSupportStatuses(): SupportStatusRecord[] {
+  const at = '2026-09-24T04:20:00.000Z'
+  const full = (featureId: string, paragraphId: string): SupportStatusRecord => ({
+    id: `ss-${featureId}-${paragraphId}`, featureId, paragraphId, status: 'full', note: '',
+    paragraphSnapshot: initialParagraphs.find(item => item.id === paragraphId)!.text, updatedAt: at
+  })
+  const partial = (featureId: string, paragraphId: string, note: string): SupportStatusRecord => ({
+    ...full(featureId, paragraphId), id: `ss-${featureId}-${paragraphId}`, status: 'partial', note
+  })
+  return [
+    full('feature-a', 'para-0012'),
+    full('feature-b', 'para-0012'),
+    partial('feature-b', 'para-0018', '段落记载了布置方式，但“温湿度数据”的范围未展开。'),
+    full('feature-c', 'para-0012'),
+    full('feature-c', 'para-0031'),
+    full('feature-d', 'para-0024'),
+    partial('feature-d', 'para-0040', '气体交换等调节方式有记载，与“根据温湿度数据调节”的对应偏弱。'),
+    full('feature-e', 'para-0018'),
+    full('feature-f', 'para-0024')
+  ]
+}
 const initialAnnotations: Annotation[] = [
   { id: 'annotation-1', featureId: 'feature-b', authorRole: 'examiner', authorName: '审查员 · 李岚', text: '“温湿度数据”是否包括露点等派生数据？建议在从属权利要求中限定。', updatedAt: '2026-09-24T03:10:00.000Z' },
   { id: 'annotation-2', featureId: 'feature-d', authorRole: 'author', authorName: '代理人 · 陈昊', text: '[0024] 已支持分级调节，发布前补充除湿单元与通信模块的连接关系。', updatedAt: '2026-09-24T04:05:00.000Z' }
@@ -32,19 +54,31 @@ const initialAnnotations: Annotation[] = [
 function demoState(): WorkbenchState {
   return {
     claims: initialClaims, paragraphs: initialParagraphs, features: initialFeatures,
-    annotations: initialAnnotations, orphanMappings: [], versions: [],
+    annotations: initialAnnotations, orphanMappings: [], supportStatuses: seedSupportStatuses(), versions: [],
     role: 'author', currentUserRole: 'author', selectedClaimId: 'claim-1', selectedFeatureId: 'feature-b', activeTab: 'mapping'
   }
 }
 function clone<T>(value: T): T { return structuredClone(value) }
+export function supportStatusKey(featureId: string, paragraphId: string): string { return `${featureId}::${paragraphId}` }
+export function summarizeParagraph(text: string): string {
+  const compact = text.replace(/\s+/g, ' ').trim()
+  return compact.length > SNAPSHOT_PREVIEW ? `${compact.slice(0, SNAPSHOT_PREVIEW)}…` : compact
+}
+export const SUPPORT_STATUS_META: Record<SupportStatusKind, { label: string; tone: string }> = {
+  full: { label: '完整支持', tone: 'ok' },
+  partial: { label: '部分支持', tone: 'warn' },
+  amendment: { label: '需补正', tone: 'bad' },
+  review: { label: '待复核', tone: 'idle' }
+}
 
 @Injectable({ providedIn: 'root' })
 export class WorkbenchService implements OnDestroy {
-  private readonly initialState = this.loadState()
+  private readonly initialState = this.normalize(this.loadState())
   private readonly stateSubject = new BehaviorSubject<WorkbenchState>(this.initialState)
   private readonly historySubject = new BehaviorSubject<{ past: number; future: number }>({ past: 0, future: 0 })
   private past: WorkbenchState[] = []
   private future: WorkbenchState[] = []
+  private statusSeq = 0
 
   readonly state$ = this.stateSubject.asObservable()
   readonly history$ = this.historySubject.asObservable()
@@ -80,7 +114,7 @@ export class WorkbenchService implements OnDestroy {
   }
 
   setRole(role: Role): void {
-    this.patchState(state => { state.role = role; state.currentUserRole = role })
+    this.commit(state => { state.role = role; state.currentUserRole = role })
   }
 
   setTab(tab: string): void {
@@ -182,6 +216,34 @@ export class WorkbenchService implements OnDestroy {
     })
   }
 
+  /** 标记某条特征↔段落支持关系，并保存当时的段落正文摘要作为依据 */
+  setSupportStatus(featureId: string, paragraphId: string, status: SupportStatusKind, note?: string): void {
+    if (this.stateSubject.value.role === 'viewer') return
+    this.commit(state => {
+      const feature = state.features.find(item => item.id === featureId)
+      const paragraph = state.paragraphs.find(item => item.id === paragraphId)
+      if (!feature || !paragraph || !feature.supportIds.includes(paragraphId)) return
+      let record = state.supportStatuses.find(item => item.featureId === featureId && item.paragraphId === paragraphId)
+      if (!record) {
+        record = { id: `ss-${Date.now()}-${this.statusSeq++}`, featureId, paragraphId, status, note: '', paragraphSnapshot: '', updatedAt: '' }
+        state.supportStatuses.push(record)
+      }
+      record.status = status
+      record.paragraphSnapshot = paragraph.text
+      record.priorStatus = undefined
+      record.updatedAt = new Date().toISOString()
+      if (note !== undefined) record.note = note
+    })
+  }
+
+  updateSupportNote(featureId: string, paragraphId: string, note: string): void {
+    if (this.stateSubject.value.role === 'viewer') return
+    this.commit(state => {
+      const record = state.supportStatuses.find(item => item.featureId === featureId && item.paragraphId === paragraphId)
+      if (record) { record.note = note; record.updatedAt = new Date().toISOString() }
+    })
+  }
+
   clearOrphan(id: string): void {
     this.commit(state => { state.orphanMappings = state.orphanMappings.filter(item => item.id !== id) })
   }
@@ -214,7 +276,8 @@ export class WorkbenchService implements OnDestroy {
     this.commit(state => {
       state.versions.unshift({
         id: `version-${Date.now()}`, name: name?.trim() || `快照 ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
-        createdAt: new Date().toISOString(), claims: clone(state.claims), features: clone(state.features)
+        createdAt: new Date().toISOString(), claims: clone(state.claims), features: clone(state.features),
+        supportStatuses: clone(state.supportStatuses)
       })
     })
   }
@@ -225,6 +288,15 @@ export class WorkbenchService implements OnDestroy {
       if (!version) return
       state.claims = clone(version.claims)
       state.features = clone(version.features)
+      // 恢复版本时带回当时的核对状态组；若段落正文此后已改动，相关关系仍需退回待复核
+      state.supportStatuses = clone(version.supportStatuses || [])
+      state.supportStatuses.forEach(record => {
+        const paragraph = state.paragraphs.find(item => item.id === record.paragraphId)
+        if (paragraph && record.paragraphSnapshot && record.paragraphSnapshot !== paragraph.text) {
+          record.priorStatus = record.status === 'review' ? record.priorStatus : record.status
+          record.status = 'review'
+        }
+      })
       if (!state.claims.some(claim => claim.id === state.selectedClaimId)) state.selectedClaimId = state.claims[0]?.id || ''
       state.selectedFeatureId = state.features.find(feature => feature.claimId === state.selectedClaimId)?.id || null
     })
@@ -265,15 +337,43 @@ export class WorkbenchService implements OnDestroy {
 
   exportCsv(): string {
     const state = this.stateSubject.value
-    const rows = state.features.map(feature => [
-      state.claims.find(claim => claim.id === feature.claimId)?.number || '', feature.label, feature.text,
-      state.features.find(item => item.id === feature.parentId)?.label || '',
-      feature.referenceIds.map(id => state.features.find(item => item.id === id)?.label || id).join('；'),
-      feature.supportIds.map(id => state.paragraphs.find(item => item.id === id)?.section || id).join('；')
-    ])
-    const csv = [['权利要求', '技术特征', '特征内容', '父级特征', '引用特征', '支持段落'], ...rows]
+    const header = ['权利要求', '技术特征', '特征内容', '父级特征', '引用特征', '支持段落', '核对状态', '依据摘要（标记时）', '状态备注', '更新时间']
+    const rows: Array<Array<string | number>> = []
+    state.features.forEach(feature => {
+      const claimNumber = state.claims.find(claim => claim.id === feature.claimId)?.number || ''
+      const base = [
+        claimNumber, feature.label, feature.text,
+        state.features.find(item => item.id === feature.parentId)?.label || '',
+        feature.referenceIds.map(id => state.features.find(item => item.id === id)?.label || id).join('；')
+      ]
+      if (!feature.supportIds.length) {
+        rows.push([...base, '', '缺少依据', '', '', ''])
+        return
+      }
+      feature.supportIds.forEach(paragraphId => {
+        const paragraph = state.paragraphs.find(item => item.id === paragraphId)
+        const record = state.supportStatuses.find(item => item.featureId === feature.id && item.paragraphId === paragraphId)
+        rows.push([
+          ...base, paragraph?.section || paragraphId,
+          record ? this.statusLabel(record, paragraph) : '待复核',
+          record ? summarizeParagraph(record.paragraphSnapshot) : '',
+          record?.note || '',
+          record?.updatedAt ? new Date(record.updatedAt).toLocaleString('zh-CN', { hour12: false }) : ''
+        ])
+      })
+    })
+    const csv = [header, ...rows]
       .map(row => row.map(value => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\n')
-    return `\uFEFF${csv}`
+    return `﻿${csv}`
+  }
+
+  statusLabel(record: SupportStatusRecord, paragraph?: Paragraph): string {
+    if (record.status === 'review') {
+      if (!record.paragraphSnapshot) return '待标记'
+      if (paragraph && record.paragraphSnapshot !== paragraph.text) return '待复核（正文已变更）'
+      return '待复核'
+    }
+    return SUPPORT_STATUS_META[record.status].label
   }
 
   validate(state = this.stateSubject.value): ValidationIssue[] {
@@ -282,6 +382,24 @@ export class WorkbenchService implements OnDestroy {
       if (!feature.text.trim()) issues.push({ id: `empty-${feature.id}`, severity: 'warning', type: 'empty-feature', featureId: feature.id, title: `${feature.label} 内容为空`, detail: '请补全技术特征文字，避免映射对象不明确。' })
       if (!feature.supportIds.length) issues.push({ id: `support-${feature.id}`, severity: 'error', type: 'missing-support', featureId: feature.id, title: `${feature.label} 缺少说明书依据`, detail: '至少为一个说明书段落建立支持映射。' })
       if (this.hasReferenceCycle(feature, state.features)) issues.push({ id: `cycle-${feature.id}`, severity: 'error', type: 'cycle', featureId: feature.id, title: `${feature.label} 存在循环引用`, detail: '特征层级或引用关系形成闭环，请移除其中一条关系。' })
+    }
+    for (const record of state.supportStatuses) {
+      const feature = state.features.find(item => item.id === record.featureId)
+      const paragraph = state.paragraphs.find(item => item.id === record.paragraphId)
+      if (!feature || !paragraph) continue
+      if (record.status !== 'review') continue
+      if (!record.paragraphSnapshot) {
+        issues.push({
+          id: `ss-unmarked-${record.id}`, severity: 'warning', type: 'stale-support', featureId: feature.id, paragraphId: paragraph.id,
+          title: `${feature.label} 的支持关系尚未核对`, detail: `${paragraph.section} 已建立映射但未标记核对结论，请选择完整支持、部分支持或需补正。`
+        })
+      } else if (record.paragraphSnapshot !== paragraph.text) {
+        const prior = record.priorStatus ? SUPPORT_STATUS_META[record.priorStatus].label : '既有'
+        issues.push({
+          id: `ss-stale-${record.id}`, severity: 'warning', type: 'stale-support', featureId: feature.id, paragraphId: paragraph.id,
+          title: `${feature.label} 的支持依据待复核`, detail: `${paragraph.section} 正文已修改，原“${prior}”结论所依据的摘要已失效，请重新核对。`
+        })
+      }
     }
     state.orphanMappings.forEach(item => issues.push({ id: item.id, severity: 'warning', type: 'orphan-mapping', title: '存在待清理映射', detail: item.reason }))
     return issues
@@ -305,6 +423,7 @@ export class WorkbenchService implements OnDestroy {
     const current = clone(this.stateSubject.value)
     const next = clone(current)
     recipe(next)
+    this.reconcileSupportStatuses(current, next)
     this.past.push(current)
     if (this.past.length > 60) this.past.shift()
     this.future = []
@@ -318,6 +437,59 @@ export class WorkbenchService implements OnDestroy {
     recipe(next)
     this.stateSubject.next(next)
     this.saveState()
+  }
+
+  /**
+   * 每次提交后维护核对状态组：
+   * - 特征/段落/映射被删除 → 同步移除记录；
+   * - 新增映射 → 生成“待标记”记录；
+   * - 段落正文变化 → 受影响记录退回“待复核”，保留原依据摘要。
+   */
+  private reconcileSupportStatuses(previous: WorkbenchState, next: WorkbenchState): void {
+    if (!Array.isArray(next.supportStatuses)) next.supportStatuses = []
+    const previousText = new Map(previous.paragraphs.map(paragraph => [paragraph.id, paragraph.text]))
+
+    this.pruneAndSeedSupportStatuses(next)
+
+    next.supportStatuses.forEach(record => {
+      if (record.status === 'review') return
+      const before = previousText.get(record.paragraphId)
+      const after = next.paragraphs.find(paragraph => paragraph.id === record.paragraphId)?.text
+      if (before !== undefined && after !== undefined && before !== after) {
+        record.priorStatus = record.status
+        record.status = 'review'
+        record.updatedAt = new Date().toISOString()
+        // paragraphSnapshot 保留为修改前的正文，供提醒与版本比较展示依据变化
+      }
+    })
+  }
+
+  /** 删除失效记录，为新增映射补建“待标记”记录 */
+  private pruneAndSeedSupportStatuses(state: WorkbenchState): void {
+    if (!Array.isArray(state.supportStatuses)) state.supportStatuses = []
+    const pairs = new Set<string>()
+    state.features.forEach(feature => feature.supportIds.forEach(paragraphId => pairs.add(supportStatusKey(feature.id, paragraphId))))
+
+    state.supportStatuses = state.supportStatuses.filter(record => {
+      if (!state.features.some(feature => feature.id === record.featureId)) return false
+      if (!state.paragraphs.some(paragraph => paragraph.id === record.paragraphId)) return false
+      return pairs.has(supportStatusKey(record.featureId, record.paragraphId))
+    })
+
+    state.features.forEach(feature => feature.supportIds.forEach(paragraphId => {
+      if (state.supportStatuses.some(record => record.featureId === feature.id && record.paragraphId === paragraphId)) return
+      state.supportStatuses.push({
+        id: `ss-${Date.now()}-${this.statusSeq++}`, featureId: feature.id, paragraphId,
+        status: 'review', note: '', paragraphSnapshot: '', updatedAt: new Date().toISOString()
+      })
+    }))
+  }
+
+  /** 加载或恢复历史数据时，清理失效记录并为缺失的映射补建待标记记录 */
+  private normalize(state: WorkbenchState): WorkbenchState {
+    if (!Array.isArray(state.supportStatuses)) state.supportStatuses = []
+    this.pruneAndSeedSupportStatuses(state)
+    return state
   }
 
   private updateHistory(): void { this.historySubject.next({ past: this.past.length, future: this.future.length }) }

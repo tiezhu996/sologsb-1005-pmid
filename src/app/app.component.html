@@ -64,9 +64,9 @@
           <section class="panel feature-list-panel">
             <div class="panel-heading"><span>技术特征树</span><p-button label="新增特征" icon="pi pi-plus" size="small" [disabled]="!canEditMainData" (onClick)="service.addFeature()" /></div>
             <div class="feature-tree">
-              <button *ngFor="let feature of claimFeatures; let i = index" type="button" class="feature-item" [class.selected]="feature.id === state.selectedFeatureId" [style.--depth]="feature.parentId ? 1 : 0" (click)="service.selectFeature(feature.id)">
+              <button *ngFor="let feature of claimFeatures; let i = index" type="button" class="feature-item" [class.selected]="feature.id === state.selectedFeatureId" [class.needs-review]="featureNeedsReview(feature.id)" [style.--depth]="feature.parentId ? 1 : 0" (click)="service.selectFeature(feature.id)">
                 <span class="feature-index">{{ feature.label.split('·')[0].trim() }}</span>
-                <span><strong>{{ feature.label }}</strong><small>{{ feature.text || '尚未填写特征内容' }}</small></span>
+                <span><strong>{{ feature.label }}<i *ngIf="featureNeedsReview(feature.id)" class="pi pi-exclamation-triangle review-dot" pTooltip="存在待复核的支持关系"></i></strong><small>{{ feature.text || '尚未填写特征内容' }}</small></span>
                 <i class="pi pi-chevron-right"></i>
               </button>
               <div *ngIf="!claimFeatures.length" class="empty-state">尚未拆分技术特征</div>
@@ -106,7 +106,7 @@
 
           <section class="panel support-panel">
             <div class="panel-heading"><span>说明书支持依据</span><span class="heading-actions"><p-badge [value]="selectedFeature?.supportIds?.length || 0" severity="success" /><p-button label="新增段落" icon="pi pi-plus" size="small" [disabled]="!canEditMainData" (onClick)="service.addParagraph()" /></span></div>
-            <p class="hint">选择段落即建立映射；取消选择会移除映射。只有至少一个段落时可消除“缺少依据”。</p>
+            <p class="hint">选择段落即建立映射；取消选择会移除映射。映射后请标记该段落对当前特征是“完整支持 / 部分支持 / 需补正”；段落正文一经修改，相关核对关系会自动退回“待复核”。</p>
             <article *ngFor="let paragraph of state.paragraphs" class="paragraph-card" [class.mapped]="selectedFeature && isMapped(selectedFeature, paragraph.id)">
               <label>
                 <input type="checkbox" [checked]="selectedFeature && isMapped(selectedFeature, paragraph.id)" [disabled]="!selectedFeature || !canEditMainData" (change)="selectedFeature && service.toggleParagraphMapping(selectedFeature.id, paragraph.id)">
@@ -118,6 +118,30 @@
                 <p-button label="删除段落" icon="pi pi-trash" severity="danger" [text]="true" size="small" (onClick)="service.deleteParagraph(paragraph.id)" />
               </div>
               <p *ngIf="!canEditMainData">{{ paragraph.text }}</p>
+
+              <div class="support-status" *ngIf="selectedFeature as feature">
+                <ng-container *ngIf="isMapped(feature, paragraph.id); else noStatusMapping">
+                  <div class="status-toolbar" role="group" [attr.aria-label]="paragraph.section + ' 对 ' + feature.label + ' 的支持核对'">
+                    <button type="button" *ngFor="let option of statusOptions" class="status-pill" [class.active]="supportKind(feature.id, paragraph.id) === option.value" [attr.data-tone]="supportKind(feature.id, paragraph.id) === option.value ? supportTone(feature.id, paragraph.id) : 'idle'" [disabled]="!canEditMainData" (click)="setSupportStatus(feature.id, paragraph.id, option.value)">{{ option.label }}</button>
+                  </div>
+                  <div class="status-evidence" [attr.data-tone]="supportTone(feature.id, paragraph.id)">
+                    <header>
+                      <span class="status-tag" [attr.data-tone]="supportTone(feature.id, paragraph.id)">{{ statusText(supportKind(feature.id, paragraph.id)) }}</span>
+                      <small *ngIf="supportRecord(feature.id, paragraph.id) as record">
+                        <ng-container *ngIf="record.status === 'review'">{{ reviewReason(record) }}</ng-container>
+                        <ng-container *ngIf="record.status !== 'review'">依据于 {{ record.updatedAt | date:'MM-dd HH:mm' }} 标记</ng-container>
+                      </small>
+                    </header>
+                    <p class="snapshot" *ngIf="supportRecord(feature.id, paragraph.id) as record">
+                      <span class="snapshot-label">标记时段落摘要</span>
+                      <ng-container *ngIf="record.paragraphSnapshot; else noSnapshot">“{{ summarize(record.paragraphSnapshot) }}”</ng-container>
+                      <ng-template #noSnapshot>尚无依据摘要，标记结论后自动保存当前段落正文。</ng-template>
+                    </p>
+                    <textarea pTextarea rows="2" class="status-note" placeholder="记录部分支持或缺漏点，例如：仅记载布置方式，未说明数据范围…" [value]="supportRecord(feature.id, paragraph.id)?.note || ''" [disabled]="!canEditMainData" (change)="updateSupportNote(feature.id, paragraph.id, $event)"></textarea>
+                  </div>
+                </ng-container>
+                <ng-template #noStatusMapping><p class="hint">勾选上方复选框建立映射后，可标记支持核对状态。</p></ng-template>
+              </div>
             </article>
           </section>
         </div>
@@ -125,6 +149,7 @@
         <div class="mapping-summary">
           <div><span>特征覆盖</span><strong>{{ claimFeatures.length }}</strong></div>
           <div><span>已建立依据</span><strong>{{ mappedFeatureCount }}</strong></div>
+          <div><span>待复核关系</span><strong [class.warn-number]="pendingReviewCount">{{ pendingReviewCount }}</strong></div>
           <div><span>待清理映射</span><strong>{{ state.orphanMappings.length }}</strong></div>
           <div><span>批注总数</span><strong>{{ state.annotations.length }}</strong></div>
         </div>
@@ -176,10 +201,38 @@
               </div>
             </article>
           </div>
+          <div *ngIf="state.versions.length >= 2" class="support-diff">
+            <h3>支持核对状态变化</h3>
+            <p class="hint">随版本一并留档的核对结论与“标记时段落摘要”；仅展示发生变化的特征↔段落关系。</p>
+            <div *ngIf="supportCompareRows().length; else noSupportDiff" class="support-diff-list">
+              <article *ngFor="let row of supportCompareRows()" [class.changed]="true">
+                <header><strong>{{ row.label }}</strong>
+                  <span class="diff-flags">
+                    <em *ngIf="row.relationChanged">映射变化</em>
+                    <em *ngIf="row.statusChanged">状态变化</em>
+                    <em *ngIf="row.snapshotChanged">依据变化</em>
+                  </span>
+                </header>
+                <div class="diff-cols">
+                  <div>
+                    <small>基准 · {{ row.beforeStatus }}</small>
+                    <p *ngIf="row.beforeSnapshot" class="snapshot-text">依据摘要：{{ row.beforeSnapshot }}</p>
+                    <p *ngIf="!row.beforeSnapshot" class="muted-text">（无依据摘要）</p>
+                  </div>
+                  <div>
+                    <small>目标 · {{ row.afterStatus }}</small>
+                    <p *ngIf="row.afterSnapshot" class="snapshot-text">依据摘要：{{ row.afterSnapshot }}</p>
+                    <p *ngIf="!row.afterSnapshot" class="muted-text">（无依据摘要）</p>
+                  </div>
+                </div>
+              </article>
+            </div>
+            <ng-template #noSupportDiff><div class="empty-state">两版之间的核对状态与依据摘要没有变化。</div></ng-template>
+          </div>
           <div class="version-history" *ngIf="state.versions.length">
             <h3>版本历史</h3>
             <div class="version-row" *ngFor="let version of state.versions">
-              <span><strong>{{ version.name }}</strong><small>{{ version.createdAt | date:'yyyy-MM-dd HH:mm' }} · {{ version.features.length }} 个特征</small></span>
+              <span><strong>{{ version.name }}</strong><small>{{ version.createdAt | date:'yyyy-MM-dd HH:mm' }} · {{ version.features.length }} 个特征 · {{ (version.supportStatuses || []).length }} 条核对记录</small></span>
               <p-button label="恢复此版" icon="pi pi-history" [outlined]="true" size="small" (onClick)="restoreVersion(version.id)" />
             </div>
           </div>
@@ -188,13 +241,28 @@
 
       <div class="view" *ngIf="state.activeTab === 'audit'">
         <section class="panel audit-panel">
-          <div class="panel-heading"><span>提交前核对清单</span><span class="status-chip" [class.ready]="!errorCount">{{ errorCount ? errorCount + ' 项待处理' : '校验通过' }}</span></div>
+          <div class="panel-heading"><span>提交前核对清单</span><span class="status-chip" [class.ready]="!errorCount && !pendingReviewCount" [class.error-chip]="errorCount">{{ errorCount ? errorCount + ' 项待处理' : pendingReviewCount ? pendingReviewCount + ' 条关系待复核' : '校验通过' }}</span></div>
           <div class="audit-item" *ngFor="let issue of issues; let i = index">
             <span class="audit-index">{{ i + 1 }}</span>
             <div><strong>{{ issue.title }}</strong><p>{{ issue.detail }}</p></div>
             <p-button label="定位" icon="pi pi-arrow-right" [text]="true" (onClick)="locateIssue(issue)" />
           </div>
           <div *ngIf="!issues.length" class="empty-success large"><i class="pi pi-check-circle"></i><strong>所有权利要求均具备说明书支持且引用关系有效。</strong></div>
+
+          <div class="support-audit" *ngIf="state.supportStatuses.length">
+            <h3>特征 ↔ 段落支持核对状态（含依据摘要）</h3>
+            <div class="support-audit-row" *ngFor="let record of state.supportStatuses" [attr.data-tone]="supportTone(record.featureId, record.paragraphId)">
+              <span class="status-tag" [attr.data-tone]="supportTone(record.featureId, record.paragraphId)">{{ statusText(record.status) }}</span>
+              <div class="support-audit-body">
+                <strong>{{ featureLabel(record.featureId) }}</strong>
+                <small>{{ paragraphLabel(record.paragraphId) }}<ng-container *ngIf="record.status === 'review'"> · {{ reviewReason(record) }}</ng-container></small>
+                <p *ngIf="record.paragraphSnapshot">依据摘要：“{{ summarize(record.paragraphSnapshot) }}”</p>
+                <p *ngIf="record.note" class="audit-note">备注：{{ record.note }}</p>
+              </div>
+              <p-button label="定位" icon="pi pi-arrow-right" [text]="true" (onClick)="locateSupport(record.featureId)" />
+            </div>
+          </div>
+
           <div class="orphan-area" *ngIf="state.orphanMappings.length">
             <h3>已删除特征遗留的映射</h3>
             <div class="orphan-row" *ngFor="let orphan of state.orphanMappings"><span>{{ orphan.reason }} 对应 {{ paragraphLabel(orphan.paragraphId) }}</span><p-button label="清理" size="small" severity="warn" (onClick)="service.clearOrphan(orphan.id)" /></div>
@@ -216,8 +284,11 @@
           <dt>批注</dt><dd>{{ featureAnnotations.length }} 条</dd>
         </dl>
         <div class="quick-map">
-          <strong>支持映射</strong>
-          <span *ngFor="let id of feature.supportIds">{{ paragraphLabel(id) }}</span>
+          <strong>支持映射与核对</strong>
+          <div *ngFor="let id of feature.supportIds" class="quick-map-row">
+            <span class="quick-map-para">{{ paragraphLabel(id) }}</span>
+            <span class="status-tag mini" [attr.data-tone]="supportTone(feature.id, id)">{{ statusText(supportKind(feature.id, id)) }}</span>
+          </div>
           <em *ngIf="!feature.supportIds.length">尚未选择说明书段落</em>
         </div>
       </section>
