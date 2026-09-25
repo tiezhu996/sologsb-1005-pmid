@@ -25,6 +25,24 @@ export interface Feature {
   ownerRole: Role
 }
 
+export type SupportStatus = 'full' | 'partial' | 'needs-fix' | 'pending'
+
+export const SUPPORT_STATUS_LABELS: Record<SupportStatus, string> = {
+  full: '完整支持',
+  partial: '部分支持',
+  'needs-fix': '需补正',
+  pending: '待复核'
+}
+
+export interface SupportAssessment {
+  id: string
+  featureId: string
+  paragraphId: string
+  status: SupportStatus
+  digest: string
+  updatedAt: string
+}
+
 export interface Annotation {
   id: string
   featureId: string
@@ -47,6 +65,7 @@ export interface ClaimVersion {
   createdAt: string
   claims: Claim[]
   features: Feature[]
+  assessments?: SupportAssessment[]
 }
 
 export interface Position {
@@ -61,6 +80,7 @@ export interface WorkbenchState {
   paragraphs: Paragraph[]
   features: Feature[]
   annotations: Annotation[]
+  assessments: SupportAssessment[]
   orphanMappings: OrphanMapping[]
   versions: ClaimVersion[]
   role: Role
@@ -73,7 +93,7 @@ export interface WorkbenchState {
 export interface ValidationIssue {
   id: string
   severity: 'error' | 'warning'
-  type: 'cycle' | 'missing-support' | 'orphan-mapping' | 'empty-feature'
+  type: 'cycle' | 'missing-support' | 'orphan-mapping' | 'empty-feature' | 'assessment-pending' | 'assessment-needs-fix'
   featureId?: string
   title: string
   detail: string

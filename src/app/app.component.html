@@ -67,7 +67,11 @@
               <button *ngFor="let feature of claimFeatures; let i = index" type="button" class="feature-item" [class.selected]="feature.id === state.selectedFeatureId" [style.--depth]="feature.parentId ? 1 : 0" (click)="service.selectFeature(feature.id)">
                 <span class="feature-index">{{ feature.label.split('·')[0].trim() }}</span>
                 <span><strong>{{ feature.label }}</strong><small>{{ feature.text || '尚未填写特征内容' }}</small></span>
-                <i class="pi pi-chevron-right"></i>
+                <span class="feature-flags">
+                  <i *ngIf="featureAssessmentFlag(feature.id) === 'needs-fix'" class="pi pi-times-circle flag-error" pTooltip="存在需补正的支持依据" tooltipPosition="left"></i>
+                  <i *ngIf="featureAssessmentFlag(feature.id) === 'pending'" class="pi pi-exclamation-triangle flag-pending" pTooltip="存在待复核的支持依据" tooltipPosition="left"></i>
+                  <i class="pi pi-chevron-right"></i>
+                </span>
               </button>
               <div *ngIf="!claimFeatures.length" class="empty-state">尚未拆分技术特征</div>
             </div>
@@ -106,7 +110,7 @@
 
           <section class="panel support-panel">
             <div class="panel-heading"><span>说明书支持依据</span><span class="heading-actions"><p-badge [value]="selectedFeature?.supportIds?.length || 0" severity="success" /><p-button label="新增段落" icon="pi pi-plus" size="small" [disabled]="!canEditMainData" (onClick)="service.addParagraph()" /></span></div>
-            <p class="hint">选择段落即建立映射；取消选择会移除映射。只有至少一个段落时可消除“缺少依据”。</p>
+            <p class="hint">选择段落即建立映射；在映射下方记录“完整支持 / 部分支持 / 需补正”结论。段落正文一旦修改，相关结论自动退回待复核。</p>
             <article *ngFor="let paragraph of state.paragraphs" class="paragraph-card" [class.mapped]="selectedFeature && isMapped(selectedFeature, paragraph.id)">
               <label>
                 <input type="checkbox" [checked]="selectedFeature && isMapped(selectedFeature, paragraph.id)" [disabled]="!selectedFeature || !canEditMainData" (change)="selectedFeature && service.toggleParagraphMapping(selectedFeature.id, paragraph.id)">
@@ -118,6 +122,21 @@
                 <p-button label="删除段落" icon="pi pi-trash" severity="danger" [text]="true" size="small" (onClick)="service.deleteParagraph(paragraph.id)" />
               </div>
               <p *ngIf="!canEditMainData">{{ paragraph.text }}</p>
+              <div *ngIf="selectedFeature && isMapped(selectedFeature, paragraph.id)" class="assessment-row">
+                <ng-container *ngIf="assessmentFor(selectedFeature.id, paragraph.id) as assessment">
+                  <div class="assessment-head">
+                    <span class="status-chip" [class.ready]="assessment.status === 'full'" [class.partial-chip]="assessment.status === 'partial'" [class.error-chip]="assessment.status === 'needs-fix'" [class.pending-chip]="assessment.status === 'pending'">{{ statusLabel(assessment.status) }}</span>
+                    <select *ngIf="canEditMainData" [value]="assessment.status === 'pending' ? '' : assessment.status" (change)="setAssessment(selectedFeature.id, paragraph.id, $event)" aria-label="支持核对结论">
+                      <option value="" disabled>记录核对结论…</option>
+                      <option value="full">完整支持</option>
+                      <option value="partial">部分支持</option>
+                      <option value="needs-fix">需补正</option>
+                    </select>
+                  </div>
+                  <small class="digest">评估时摘要：{{ assessment.digest }}</small>
+                  <small *ngIf="assessment.status === 'pending'" class="pending-note"><i class="pi pi-exclamation-triangle"></i>段落正文已变动或尚未核对，结论已退回待复核。</small>
+                </ng-container>
+              </div>
             </article>
           </section>
         </div>
@@ -125,6 +144,7 @@
         <div class="mapping-summary">
           <div><span>特征覆盖</span><strong>{{ claimFeatures.length }}</strong></div>
           <div><span>已建立依据</span><strong>{{ mappedFeatureCount }}</strong></div>
+          <div><span>待复核依据</span><strong>{{ pendingAssessmentCount }}</strong></div>
           <div><span>待清理映射</span><strong>{{ state.orphanMappings.length }}</strong></div>
           <div><span>批注总数</span><strong>{{ state.annotations.length }}</strong></div>
         </div>
@@ -176,10 +196,23 @@
               </div>
             </article>
           </div>
+          <div *ngIf="state.versions.length >= 2" class="assessment-diff">
+            <h3>支持核对状态与依据摘要</h3>
+            <div class="diff-list">
+              <article *ngFor="let row of compareAssessments()" [class.changed]="row.changed">
+                <header><strong>{{ row.featureLabel }} · {{ row.paragraphLabel }}</strong><span>{{ row.changed ? '有变化' : '未变化' }}</span></header>
+                <div class="diff-cols">
+                  <div><small>基准 · {{ row.beforeStatus }}</small><p>{{ row.beforeDigest }}</p></div>
+                  <div><small>目标 · {{ row.afterStatus }}</small><p>{{ row.afterDigest }}</p></div>
+                </div>
+              </article>
+              <div *ngIf="!compareAssessments().length" class="empty-state">两版均未记录支持核对状态。</div>
+            </div>
+          </div>
           <div class="version-history" *ngIf="state.versions.length">
             <h3>版本历史</h3>
             <div class="version-row" *ngFor="let version of state.versions">
-              <span><strong>{{ version.name }}</strong><small>{{ version.createdAt | date:'yyyy-MM-dd HH:mm' }} · {{ version.features.length }} 个特征</small></span>
+              <span><strong>{{ version.name }}</strong><small>{{ version.createdAt | date:'yyyy-MM-dd HH:mm' }} · {{ version.features.length }} 个特征 · {{ version.assessments?.length || 0 }} 条核对状态</small></span>
               <p-button label="恢复此版" icon="pi pi-history" [outlined]="true" size="small" (onClick)="restoreVersion(version.id)" />
             </div>
           </div>
@@ -195,6 +228,16 @@
             <p-button label="定位" icon="pi pi-arrow-right" [text]="true" (onClick)="locateIssue(issue)" />
           </div>
           <div *ngIf="!issues.length" class="empty-success large"><i class="pi pi-check-circle"></i><strong>所有权利要求均具备说明书支持且引用关系有效。</strong></div>
+          <div class="assessment-overview" *ngIf="state.features.length">
+            <h3>支持核对状态总览</h3>
+            <div class="assessment-overview-row" *ngFor="let feature of state.features">
+              <strong>{{ feature.label }}</strong>
+              <span class="overview-chips">
+                <span *ngFor="let paragraphId of feature.supportIds" class="overview-chip" [class.chip-full]="assessmentFor(feature.id, paragraphId)?.status === 'full'" [class.chip-partial]="assessmentFor(feature.id, paragraphId)?.status === 'partial'" [class.chip-needs-fix]="assessmentFor(feature.id, paragraphId)?.status === 'needs-fix'" [class.chip-pending]="!assessmentFor(feature.id, paragraphId) || assessmentFor(feature.id, paragraphId)?.status === 'pending'">{{ paragraphLabel(paragraphId) }} · {{ statusLabel(assessmentFor(feature.id, paragraphId)?.status) }}</span>
+                <em *ngIf="!feature.supportIds.length">无支持段落</em>
+              </span>
+            </div>
+          </div>
           <div class="orphan-area" *ngIf="state.orphanMappings.length">
             <h3>已删除特征遗留的映射</h3>
             <div class="orphan-row" *ngFor="let orphan of state.orphanMappings"><span>{{ orphan.reason }} 对应 {{ paragraphLabel(orphan.paragraphId) }}</span><p-button label="清理" size="small" severity="warn" (onClick)="service.clearOrphan(orphan.id)" /></div>
@@ -217,7 +260,7 @@
         </dl>
         <div class="quick-map">
           <strong>支持映射</strong>
-          <span *ngFor="let id of feature.supportIds">{{ paragraphLabel(id) }}</span>
+          <span *ngFor="let id of feature.supportIds">{{ paragraphLabel(id) }} · {{ statusLabel(assessmentFor(feature.id, id)?.status) }}</span>
           <em *ngIf="!feature.supportIds.length">尚未选择说明书段落</em>
         </div>
       </section>
@@ -238,7 +281,7 @@
 
 <p-dialog header="保存版本快照" [(visible)]="versionDialog" [modal]="true" [style]="{ width: '460px' }">
   <div class="dialog-body">
-    <p>保存当前全部权利要求和技术特征，用于后续比较或恢复。</p>
+    <p>保存当前全部权利要求、技术特征与支持核对状态，用于后续比较或恢复。</p>
     <label>版本名称<input pInputText [(ngModel)]="versionName" placeholder="例如：答复审查意见前" (keyup.enter)="createVersion()"></label>
   </div>
   <ng-template pTemplate="footer">

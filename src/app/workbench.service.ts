@@ -1,6 +1,7 @@
 import { Injectable, OnDestroy } from '@angular/core'
 import { BehaviorSubject, map, type Observable } from 'rxjs'
-import type { Annotation, Claim, ClaimVersion, Feature, Paragraph, Position, Role, ValidationIssue, WorkbenchState } from './models'
+import { SUPPORT_STATUS_LABELS } from './models'
+import type { Annotation, Claim, ClaimVersion, Feature, Paragraph, Position, Role, SupportAssessment, SupportStatus, ValidationIssue, WorkbenchState } from './models'
 
 const STORAGE_KEY = 'patent-claim-mapping-workbench-v1'
 const POSITION_KEY = 'patent-claim-mapping-position-v1'
@@ -29,10 +30,39 @@ const initialAnnotations: Annotation[] = [
   { id: 'annotation-1', featureId: 'feature-b', authorRole: 'examiner', authorName: '审查员 · 李岚', text: '“温湿度数据”是否包括露点等派生数据？建议在从属权利要求中限定。', updatedAt: '2026-09-24T03:10:00.000Z' },
   { id: 'annotation-2', featureId: 'feature-d', authorRole: 'author', authorName: '代理人 · 陈昊', text: '[0024] 已支持分级调节，发布前补充除湿单元与通信模块的连接关系。', updatedAt: '2026-09-24T04:05:00.000Z' }
 ]
+function digestOf(paragraph: Paragraph): string {
+  const text = paragraph.text.replace(/\s+/g, ' ').trim()
+  const summary = text.length > 36 ? `${text.slice(0, 36)}…` : text
+  return `${paragraph.section} · ${summary || '（空段落）'}`
+}
+const demoAssessmentStatus: Record<string, SupportStatus> = {
+  'feature-a::para-0012': 'full',
+  'feature-b::para-0012': 'full',
+  'feature-b::para-0018': 'partial',
+  'feature-c::para-0012': 'full',
+  'feature-c::para-0031': 'full',
+  'feature-d::para-0024': 'full',
+  'feature-d::para-0040': 'partial',
+  'feature-e::para-0018': 'full',
+  'feature-f::para-0024': 'full'
+}
+function demoAssessments(): SupportAssessment[] {
+  const assessments: SupportAssessment[] = []
+  initialFeatures.forEach(feature => feature.supportIds.forEach(paragraphId => {
+    const paragraph = initialParagraphs.find(item => item.id === paragraphId)
+    if (!paragraph) return
+    assessments.push({
+      id: `assessment-${feature.id}-${paragraphId}`, featureId: feature.id, paragraphId,
+      status: demoAssessmentStatus[`${feature.id}::${paragraphId}`] || 'full',
+      digest: digestOf(paragraph), updatedAt: '2026-09-24T04:30:00.000Z'
+    })
+  }))
+  return assessments
+}
 function demoState(): WorkbenchState {
   return {
     claims: initialClaims, paragraphs: initialParagraphs, features: initialFeatures,
-    annotations: initialAnnotations, orphanMappings: [], versions: [],
+    annotations: initialAnnotations, assessments: demoAssessments(), orphanMappings: [], versions: [],
     role: 'author', currentUserRole: 'author', selectedClaimId: 'claim-1', selectedFeatureId: 'feature-b', activeTab: 'mapping'
   }
 }
@@ -117,7 +147,17 @@ export class WorkbenchService implements OnDestroy {
     if (this.stateSubject.value.role === 'viewer') return
     this.commit(state => {
       const paragraph = state.paragraphs.find(item => item.id === id)
-      if (paragraph) Object.assign(paragraph, patch)
+      if (!paragraph) return
+      const textChanged = patch.text !== undefined && patch.text !== paragraph.text
+      Object.assign(paragraph, patch)
+      if (textChanged) {
+        state.assessments.forEach(assessment => {
+          if (assessment.paragraphId === id && assessment.status !== 'pending') {
+            assessment.status = 'pending'
+            assessment.updatedAt = new Date().toISOString()
+          }
+        })
+      }
     })
   }
 
@@ -127,6 +167,7 @@ export class WorkbenchService implements OnDestroy {
       state.paragraphs = state.paragraphs.filter(item => item.id !== id)
       state.features.forEach(feature => { feature.supportIds = feature.supportIds.filter(paragraphId => paragraphId !== id) })
       state.orphanMappings = state.orphanMappings.filter(item => item.paragraphId !== id)
+      this.reconcileAssessments(state)
     })
   }
 
@@ -148,6 +189,7 @@ export class WorkbenchService implements OnDestroy {
     this.commit(state => {
       const feature = state.features.find(item => item.id === id)
       if (feature) Object.assign(feature, patch)
+      this.reconcileAssessments(state)
     })
   }
 
@@ -166,6 +208,7 @@ export class WorkbenchService implements OnDestroy {
         if (item.parentId === id) item.parentId = null
       })
       state.annotations = state.annotations.filter(item => item.featureId !== id)
+      this.reconcileAssessments(state)
       state.selectedFeatureId = state.features.find(item => item.claimId === state.selectedClaimId)?.id || null
     })
   }
@@ -179,6 +222,19 @@ export class WorkbenchService implements OnDestroy {
       if (index >= 0) feature.supportIds.splice(index, 1)
       else feature.supportIds.push(paragraphId)
       state.orphanMappings = state.orphanMappings.filter(item => item.paragraphId !== paragraphId)
+      this.reconcileAssessments(state)
+    })
+  }
+
+  setAssessmentStatus(featureId: string, paragraphId: string, status: Exclude<SupportStatus, 'pending'>): void {
+    if (this.stateSubject.value.role === 'viewer') return
+    this.commit(state => {
+      const assessment = state.assessments.find(item => item.featureId === featureId && item.paragraphId === paragraphId)
+      const paragraph = state.paragraphs.find(item => item.id === paragraphId)
+      if (!assessment || !paragraph) return
+      assessment.status = status
+      assessment.digest = digestOf(paragraph)
+      assessment.updatedAt = new Date().toISOString()
     })
   }
 
@@ -213,8 +269,8 @@ export class WorkbenchService implements OnDestroy {
   createVersion(name?: string): void {
     this.commit(state => {
       state.versions.unshift({
-        id: `version-${Date.now()}`, name: name?.trim() || `快照 ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
-        createdAt: new Date().toISOString(), claims: clone(state.claims), features: clone(state.features)
+        id: `version-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, name: name?.trim() || `快照 ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+        createdAt: new Date().toISOString(), claims: clone(state.claims), features: clone(state.features), assessments: clone(state.assessments)
       })
     })
   }
@@ -225,6 +281,8 @@ export class WorkbenchService implements OnDestroy {
       if (!version) return
       state.claims = clone(version.claims)
       state.features = clone(version.features)
+      state.assessments = clone(version.assessments ?? [])
+      this.reconcileAssessments(state)
       if (!state.claims.some(claim => claim.id === state.selectedClaimId)) state.selectedClaimId = state.claims[0]?.id || ''
       state.selectedFeatureId = state.features.find(feature => feature.claimId === state.selectedClaimId)?.id || null
     })
@@ -265,23 +323,34 @@ export class WorkbenchService implements OnDestroy {
 
   exportCsv(): string {
     const state = this.stateSubject.value
-    const rows = state.features.map(feature => [
-      state.claims.find(claim => claim.id === feature.claimId)?.number || '', feature.label, feature.text,
-      state.features.find(item => item.id === feature.parentId)?.label || '',
-      feature.referenceIds.map(id => state.features.find(item => item.id === id)?.label || id).join('；'),
-      feature.supportIds.map(id => state.paragraphs.find(item => item.id === id)?.section || id).join('；')
-    ])
-    const csv = [['权利要求', '技术特征', '特征内容', '父级特征', '引用特征', '支持段落'], ...rows]
+    const rows = state.features.map(feature => {
+      const assessments = feature.supportIds.map(paragraphId => state.assessments.find(item => item.featureId === feature.id && item.paragraphId === paragraphId))
+      return [
+        state.claims.find(claim => claim.id === feature.claimId)?.number || '', feature.label, feature.text,
+        state.features.find(item => item.id === feature.parentId)?.label || '',
+        feature.referenceIds.map(id => state.features.find(item => item.id === id)?.label || id).join('；'),
+        feature.supportIds.map(id => state.paragraphs.find(item => item.id === id)?.section || id).join('；'),
+        assessments.map(assessment => SUPPORT_STATUS_LABELS[assessment?.status || 'pending']).join('；'),
+        assessments.map(assessment => assessment?.digest || '').join('；')
+      ]
+    })
+    const csv = [['权利要求', '技术特征', '特征内容', '父级特征', '引用特征', '支持段落', '支持状态', '依据摘要'], ...rows]
       .map(row => row.map(value => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\n')
     return `\uFEFF${csv}`
   }
 
   validate(state = this.stateSubject.value): ValidationIssue[] {
     const issues: ValidationIssue[] = []
+    const assessments = state.assessments ?? []
+    const sectionOf = (id: string): string => state.paragraphs.find(item => item.id === id)?.section || id
     for (const feature of state.features) {
       if (!feature.text.trim()) issues.push({ id: `empty-${feature.id}`, severity: 'warning', type: 'empty-feature', featureId: feature.id, title: `${feature.label} 内容为空`, detail: '请补全技术特征文字，避免映射对象不明确。' })
       if (!feature.supportIds.length) issues.push({ id: `support-${feature.id}`, severity: 'error', type: 'missing-support', featureId: feature.id, title: `${feature.label} 缺少说明书依据`, detail: '至少为一个说明书段落建立支持映射。' })
       if (this.hasReferenceCycle(feature, state.features)) issues.push({ id: `cycle-${feature.id}`, severity: 'error', type: 'cycle', featureId: feature.id, title: `${feature.label} 存在循环引用`, detail: '特征层级或引用关系形成闭环，请移除其中一条关系。' })
+      const pending = assessments.filter(item => item.featureId === feature.id && item.status === 'pending')
+      if (pending.length) issues.push({ id: `pending-${feature.id}`, severity: 'warning', type: 'assessment-pending', featureId: feature.id, title: `${feature.label} 有 ${pending.length} 条支持依据待复核`, detail: `涉及 ${pending.map(item => sectionOf(item.paragraphId)).join('、')}。段落正文变动或尚未核对，请重新确认支持结论。` })
+      const needsFix = assessments.filter(item => item.featureId === feature.id && item.status === 'needs-fix')
+      if (needsFix.length) issues.push({ id: `needs-fix-${feature.id}`, severity: 'error', type: 'assessment-needs-fix', featureId: feature.id, title: `${feature.label} 的支持依据需补正`, detail: `${needsFix.map(item => sectionOf(item.paragraphId)).join('、')} 被标记为需补正，提交答复前必须处理。` })
     }
     state.orphanMappings.forEach(item => issues.push({ id: item.id, severity: 'warning', type: 'orphan-mapping', title: '存在待清理映射', detail: item.reason }))
     return issues
@@ -322,11 +391,31 @@ export class WorkbenchService implements OnDestroy {
 
   private updateHistory(): void { this.historySubject.next({ past: this.past.length, future: this.future.length }) }
   private saveState(): void { if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, JSON.stringify(this.stateSubject.value)) }
+  private reconcileAssessments(state: WorkbenchState): void {
+    if (!Array.isArray(state.assessments)) state.assessments = []
+    const valid = new Set<string>()
+    state.features.forEach(feature => feature.supportIds.forEach(paragraphId => {
+      if (state.paragraphs.some(item => item.id === paragraphId)) valid.add(`${feature.id}::${paragraphId}`)
+    }))
+    state.assessments = state.assessments.filter(item => valid.has(`${item.featureId}::${item.paragraphId}`))
+    valid.forEach(key => {
+      if (state.assessments.some(item => `${item.featureId}::${item.paragraphId}` === key)) return
+      const [featureId, paragraphId] = key.split('::')
+      const paragraph = state.paragraphs.find(item => item.id === paragraphId)
+      state.assessments.push({
+        id: `assessment-${featureId}-${paragraphId}`, featureId, paragraphId,
+        status: 'pending', digest: paragraph ? digestOf(paragraph) : '', updatedAt: new Date().toISOString()
+      })
+    })
+  }
   private loadState(): WorkbenchState {
     if (typeof localStorage === 'undefined') return demoState()
     try {
       const stored = localStorage.getItem(STORAGE_KEY)
-      return stored ? { ...demoState(), ...JSON.parse(stored) } : demoState()
+      if (!stored) return demoState()
+      const state = { ...demoState(), ...JSON.parse(stored) } as WorkbenchState
+      this.reconcileAssessments(state)
+      return state
     } catch { return demoState() }
   }
 }
